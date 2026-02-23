@@ -6,6 +6,7 @@
 <title>CatalogoPro — Generador de Catálogos</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jsbarcode/3.11.5/JsBarcode.all.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@zxing/library@0.21.3/umd/index.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;0,900;1,400&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
   :root {
@@ -1913,149 +1914,185 @@ function toast(msg, type = 'success') {
 }
 
 // ============================================================
-// BARCODE SCANNER — usa BarcodeDetector API nativa
+// BARCODE SCANNER — ZXing con fallback a BarcodeDetector
 // ============================================================
-let scannerStream = null;
-let scannerRAF = null;
-let scannerRunning = false;
+let scannerStream   = null;
+let scannerRunning  = false;
+let scannerRAF      = null;
+let zxingReader     = null;
 
 window.openScanner = async function() {
   const overlay = document.getElementById('scannerOverlay');
-  const status = document.getElementById('scannerStatus');
-  const video = document.getElementById('scannerVideo');
+  const status  = document.getElementById('scannerStatus');
+  const video   = document.getElementById('scannerVideo');
 
   overlay.classList.add('open');
-  status.className = 'scanner-status';
+  status.className   = 'scanner-status';
   status.textContent = 'Iniciando cámara…';
+  scannerRunning     = true;
 
-  // Verificar soporte
-  if (!('BarcodeDetector' in window)) {
-    status.className = 'scanner-status error';
-    status.textContent = '⚠️ Tu navegador no soporta escaneo. Usa Chrome 83+ o Edge. Ingresa el código manualmente.';
+  // ── 1. Arrancar stream de video ──
+  try {
+    try {
+      scannerStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
+      });
+    } catch {
+      scannerStream = await navigator.mediaDevices.getUserMedia({ video: true });
+    }
+    video.srcObject = scannerStream;
+    await video.play();
+  } catch (err) {
+    status.className   = 'scanner-status error';
+    status.textContent = err.name === 'NotAllowedError'
+      ? '🚫 Permiso de cámara denegado. Habilítalo en ajustes del navegador.'
+      : '📷 No se pudo acceder a la cámara: ' + err.message;
     return;
   }
 
+  // ── 2. Selector de cámara ──
   try {
-    // Intentar cámara trasera primero
-    const constraints = {
-      video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
-    };
-
-    try {
-      scannerStream = await navigator.mediaDevices.getUserMedia(constraints);
-    } catch {
-      // Si falla facingMode, intentar cualquier cámara
-      scannerStream = await navigator.mediaDevices.getUserMedia({ video: true });
-    }
-
-    video.srcObject = scannerStream;
-    await video.play();
-
-    // Detectar cámaras disponibles para el selector
     const devices = await navigator.mediaDevices.enumerateDevices();
     const cameras = devices.filter(d => d.kind === 'videoinput');
-    const selectWrap = document.getElementById('cameraSelectWrap');
-    const select = document.getElementById('cameraSelect');
-
+    const wrap    = document.getElementById('cameraSelectWrap');
+    const sel     = document.getElementById('cameraSelect');
     if (cameras.length > 1) {
-      const currentTrack = scannerStream.getVideoTracks()[0];
-      const currentSettings = currentTrack.getSettings();
-
-      select.innerHTML = cameras.map((d, i) =>
-        `<option value="${d.deviceId}" ${d.deviceId === currentSettings.deviceId ? 'selected' : ''}>
+      const cur = scannerStream.getVideoTracks()[0].getSettings().deviceId;
+      sel.innerHTML = cameras.map((d, i) =>
+        `<option value="${d.deviceId}" ${d.deviceId === cur ? 'selected' : ''}>
           ${d.label || 'Cámara ' + (i + 1)}
-        </option>`
-      ).join('');
-      selectWrap.style.display = 'flex';
+        </option>`).join('');
+      wrap.style.display = 'flex';
     } else {
-      selectWrap.style.display = 'none';
+      wrap.style.display = 'none';
+    }
+  } catch(_) {}
+
+  status.textContent = 'Apunta al código de barras o QR…';
+
+  // ── 3. Elegir motor de detección ──
+  const useZXing = typeof ZXing !== 'undefined' && ZXing.MultiFormatReader;
+
+  if (useZXing) {
+    // ── ZXing (soporta QR, EAN, Code128, etc.) ──
+    try {
+      const hints = new Map();
+      const formats = [
+        ZXing.BarcodeFormat.QR_CODE,
+        ZXing.BarcodeFormat.EAN_13,
+        ZXing.BarcodeFormat.EAN_8,
+        ZXing.BarcodeFormat.UPC_A,
+        ZXing.BarcodeFormat.UPC_E,
+        ZXing.BarcodeFormat.CODE_128,
+        ZXing.BarcodeFormat.CODE_39,
+        ZXing.BarcodeFormat.DATA_MATRIX,
+        ZXing.BarcodeFormat.ITF,
+      ].filter(Boolean);
+      hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, formats);
+      hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+
+      zxingReader = new ZXing.MultiFormatReader();
+      zxingReader.setHints(hints);
+
+      // Canvas auxiliar para capturar frames
+      const canvas = document.createElement('canvas');
+      const ctx    = canvas.getContext('2d', { willReadFrequently: true });
+
+      const tick = () => {
+        if (!scannerRunning) return;
+        if (video.readyState === video.HAVE_ENOUGH_DATA) {
+          canvas.width  = video.videoWidth;
+          canvas.height = video.videoHeight;
+          ctx.drawImage(video, 0, 0);
+          try {
+            const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            const luminance = new ZXing.RGBLuminanceSource(imageData.data, canvas.width, canvas.height);
+            const bitmap    = new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(luminance));
+            const result    = zxingReader.decode(bitmap);
+            if (result) {
+              onCodeDetected(result.getText());
+              return;
+            }
+          } catch(_) { /* no code in this frame */ }
+        }
+        scannerRAF = requestAnimationFrame(tick);
+      };
+      scannerRAF = requestAnimationFrame(tick);
+
+    } catch(e) {
+      status.className   = 'scanner-status error';
+      status.textContent = 'Error iniciando ZXing: ' + e.message;
     }
 
-    // Crear detector
-    const detector = new BarcodeDetector({
-      formats: ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'code_93', 'itf', 'qr_code', 'data_matrix']
-    });
+  } else if ('BarcodeDetector' in window) {
+    // ── Fallback: BarcodeDetector nativa ──
+    let formats = ['ean_13','ean_8','upc_a','upc_e','code_128','code_39','qr_code','data_matrix','itf'];
+    try {
+      const supported = await BarcodeDetector.getSupportedFormats();
+      formats = formats.filter(f => supported.includes(f));
+    } catch(_) {}
 
-    scannerRunning = true;
-    status.textContent = 'Apunta la cámara al código de barras…';
-
+    const detector = new BarcodeDetector({ formats });
     const tick = async () => {
       if (!scannerRunning) return;
-
       if (video.readyState === video.HAVE_ENOUGH_DATA) {
         try {
-          const barcodes = await detector.detect(video);
-          if (barcodes.length > 0) {
-            const code = barcodes[0].rawValue;
-            document.getElementById('pBarcode').value = code;
-            status.className = 'scanner-status detected';
-            status.textContent = `✅ Detectado: ${code}`;
-
-            const vc = document.getElementById('videoContainer');
-            vc.classList.add('success');
-            setTimeout(() => vc.classList.remove('success'), 600);
-
-            setTimeout(() => {
-              window.closeScanner();
-              toast(`Código capturado: ${code}`, 'success');
-            }, 700);
-            return;
-          }
-        } catch (_) {}
+          const codes = await detector.detect(video);
+          if (codes.length) { onCodeDetected(codes[0].rawValue); return; }
+        } catch(_) {}
       }
-
       scannerRAF = requestAnimationFrame(tick);
     };
-
     scannerRAF = requestAnimationFrame(tick);
 
-  } catch (err) {
-    status.className = 'scanner-status error';
-    if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-      status.textContent = '🚫 Permiso de cámara denegado. Habilítalo en la configuración del navegador.';
-    } else if (err.name === 'NotFoundError') {
-      status.textContent = '📷 No se encontró ninguna cámara en este dispositivo.';
-    } else {
-      status.textContent = 'Error al iniciar cámara: ' + err.message;
-    }
+  } else {
+    status.className   = 'scanner-status error';
+    status.textContent = '⚠️ Escaneo no disponible en este navegador. Ingresa el código manualmente.';
   }
 };
+
+function onCodeDetected(code) {
+  document.getElementById('pBarcode').value = code;
+  const status = document.getElementById('scannerStatus');
+  status.className   = 'scanner-status detected';
+  status.textContent = '✅ Detectado: ' + code;
+  const vc = document.getElementById('videoContainer');
+  vc.classList.add('success');
+  setTimeout(() => {
+    window.closeScanner();
+    toast('Código capturado: ' + code, 'success');
+  }, 700);
+}
 
 window.closeScanner = function() {
   scannerRunning = false;
   if (scannerRAF) { cancelAnimationFrame(scannerRAF); scannerRAF = null; }
-  if (scannerStream) {
-    scannerStream.getTracks().forEach(t => t.stop());
-    scannerStream = null;
-  }
+  if (scannerStream) { scannerStream.getTracks().forEach(t => t.stop()); scannerStream = null; }
   const video = document.getElementById('scannerVideo');
-  video.srcObject = null;
+  if (video) { video.srcObject = null; }
+  const vc = document.getElementById('videoContainer');
+  if (vc) vc.classList.remove('success');
   document.getElementById('scannerOverlay').classList.remove('open');
   document.getElementById('cameraSelectWrap').style.display = 'none';
 };
 
 window.switchCamera = async function(deviceId) {
-  if (scannerStream) {
-    scannerStream.getTracks().forEach(t => t.stop());
-  }
+  if (scannerStream) { scannerStream.getTracks().forEach(t => t.stop()); }
   const video = document.getElementById('scannerVideo');
   try {
     scannerStream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: deviceId } } });
     video.srcObject = scannerStream;
     await video.play();
-  } catch (err) {
-    document.getElementById('scannerStatus').textContent = 'Error al cambiar cámara: ' + err.message;
+  } catch(e) {
+    document.getElementById('scannerStatus').textContent = 'Error al cambiar cámara: ' + e.message;
   }
 };
 
-// Cerrar con ESC
 document.addEventListener('keydown', e => {
-  if (e.key === 'Escape' && document.getElementById('scannerOverlay').classList.contains('open')) {
+  if (e.key === 'Escape' && document.getElementById('scannerOverlay').classList.contains('open'))
     window.closeScanner();
-  }
 });
 
-// Cerrar al click fuera
 document.getElementById('scannerOverlay').addEventListener('click', e => {
   if (e.target === document.getElementById('scannerOverlay')) window.closeScanner();
 });
